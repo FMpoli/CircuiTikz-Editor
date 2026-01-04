@@ -1,0 +1,46 @@
+\documentclass[margin=1cm]{standalone}
+\usepackage[utf8]{inputenc}
+\usepackage[american]{circuitikz}
+\usetikzlibrary{calc}
+
+\begin{document}
+
+
+
+
+\begin{circuitikz}[american]
+    \ctikzset{tripoles/nmos/height=2.0, tripoles/nmos/width=1.0}
+    \ctikzset{tripoles/pmos/height=2.0, tripoles/pmos/width=1.0}
+    \ctikzset{tripoles/npn/height=2.0, tripoles/npn/width=1.0}
+    \ctikzset{tripoles/pnp/height=2.0, tripoles/pnp/width=1.0}
+    \ctikzset{tripoles/nfet/height=2.0, tripoles/nfet/width=1.0}
+    \ctikzset{tripoles/pfet/height=2.0, tripoles/pfet/width=1.0}
+    \ctikzset{tripoles/nfetd/height=2.0, tripoles/nfetd/width=1.0}
+    \ctikzset{tripoles/pfetd/height=2.0, tripoles/pfetd/width=1.0}
+    \ctikzset{tripoles/njfet/height=2.0, tripoles/njfet/width=1.0}
+    \ctikzset{tripoles/pjfet/height=2.0, tripoles/pjfet/width=1.0}
+    \ctikzset{tripoles/hemt/height=2.0, tripoles/hemt/width=1.0}
+    \ctikzset{tripoles/nigbt/height=2.0, tripoles/nigbt/width=1.0}
+    \ctikzset{tripoles/pigbt/height=2.0, tripoles/pigbt/width=1.0}
+    \ctikzset{monopoles/vcc/arrow={Triangle[open, length=8pt, width=14pt]}}
+    \ctikzset{monopoles/vee/arrow={Triangle[open, length=8pt, width=14pt]}}
+    \node[pfetd, bulk] (U1) at (6.0,7.3) {};
+    \draw (U1.bulk) -- (U1.D);
+    \node[vcc] (VCC2) at (6.0,10.8) {};
+    \node[ground] (GND1) at (6.0,2.5) {};
+    \draw (2.5,4.8) to[R] (2.5,6.8);
+    \draw (U1.S) -- (VCC2);
+    \draw (U1.G) -- (3.8,7.3);
+    \draw (2.5,6.8) |- (3.8,7.3);
+    \draw (2.5,4.8) |- (2.8,4.3);
+    \draw (U1.D) -- (6.0,4.3);
+    \draw (6.0,4.3) -- (GND1);
+    \draw (2.8,4.3) -- (6.0,4.3);
+    \node[circ] at (6.0,4.3) {};
+\end{circuitikz}
+
+
+
+
+
+\end{document}
