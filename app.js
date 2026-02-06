@@ -65,6 +65,18 @@ class CircuitEditor {
 
         // Clipboard for copy/paste
         this.clipboard = null;
+        this.isParsingCode = false;
+        this.parseTimer = null;
+
+        // Codice modificato a mano: non sovrascrivere con la canvas
+        this.codeManuallyEdited = false;
+
+        // LaTeX Label Cache
+        this.labelCache = new Map(); // "latex-color-size" -> HTMLImageElement
+
+        // Simboli opzionali da CircuiTikZ-Designer (data/symbols-designer.svg): id -> { viewBox, content }
+        this.designerSymbols = new Map();
+        this.designerSymbolImages = new Map(); // "symbolId_color_w_h" -> HTMLImageElement (cache per disegno)
 
         // Initialize
         this.init();
@@ -75,7 +87,43 @@ class CircuitEditor {
         this.setupEventListeners();
         this.populateComponentLibrary();
         this.setupZoom();
+        this.loadDesignerSymbols(); // async: quando pronto fa render()
         this.render();
+    }
+
+    async loadDesignerSymbols() {
+        const url = (typeof window.DESIGNER_SYMBOLS_URL !== 'undefined')
+            ? window.DESIGNER_SYMBOLS_URL
+            : 'data/symbols-designer.svg';
+        try {
+            const res = await fetch(url);
+            if (!res.ok) return;
+            const text = await res.text();
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(text, 'image/svg+xml');
+            // ViewBox per symbol: nei Designer è in <metadata><component><variant viewBox="..." for="node_xxx">, non sul <symbol>
+            const forIdToViewBox = new Map();
+            doc.querySelectorAll('variant[viewBox][for]').forEach(v => {
+                const forId = v.getAttribute('for');
+                const vb = v.getAttribute('viewBox');
+                if (forId && vb && !forIdToViewBox.has(forId)) forIdToViewBox.set(forId, vb);
+            });
+            this.designerSymbolImages.clear();
+            const symbols = doc.querySelectorAll('symbol[id]');
+            const defsEl = document.getElementById('designerSymbolsDefsInner');
+            if (!defsEl) return;
+            symbols.forEach(sym => {
+                const id = sym.getAttribute('id');
+                if (!id) return;
+                const clone = sym.cloneNode(true);
+                defsEl.appendChild(clone);
+                const viewBox = sym.getAttribute('viewBox') || forIdToViewBox.get(id) || '0 0 80 40';
+                this.designerSymbols.set(id, { viewBox, content: sym.innerHTML });
+            });
+            if (this.designerSymbols.size > 0) this.render();
+        } catch (e) {
+            // File assente o errore: si usano i simboli predefiniti
+        }
     }
 
     setupZoom() {
@@ -289,6 +337,10 @@ class CircuitEditor {
         document.getElementById('copyBtn').onclick = () => this.copySelected();
         document.getElementById('cutBtn').onclick = () => this.cutSelected();
         document.getElementById('pasteBtn').onclick = () => this.paste();
+        document.getElementById('exportBtn').onclick = () => {
+            const format = document.getElementById('exportFormat').value;
+            this.exportImage(format);
+        };
 
         // View utility buttons
         document.getElementById('fitViewBtn').onclick = () => this.fitView();
@@ -303,9 +355,74 @@ class CircuitEditor {
         });
 
         // Code panel
+        document.getElementById('syncFromCanvasBtn').addEventListener('click', () => {
+            this.updateCode(true); // Forza sovrascrittura: codice = canvas
+            this.showToast('Codice aggiornato dalla canvas', 'success');
+        });
+        document.getElementById('importToCanvasBtn').addEventListener('click', () => {
+            const code = document.getElementById('codeOutput').value;
+            if (code && code.includes('\\begin{circuitikz}')) {
+                this.parseCode(code);
+                this.codeManuallyEdited = false; // Ora canvas e codice sono allineati (da codice)
+                this.showToast('Codice importato nella canvas', 'success');
+                this.render();
+            } else {
+                this.showToast('Inserisci codice Circuitikz valido', 'error');
+            }
+        });
+        document.getElementById('previewLaTeXBtn').addEventListener('click', () => this.previewLaTeX());
+        document.getElementById('closePreviewBtn').addEventListener('click', () => {
+            document.getElementById('latexPreviewPanel').style.display = 'none';
+        });
+        document.getElementById('openInOverleafLink').addEventListener('click', (e) => {
+            const code = document.getElementById('codeOutput').value;
+            if (code && navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(code).then(() => {
+                    this.showToast('Codice copiato: incolla in Overleaf (Ctrl+V)', '');
+                }).catch(() => {});
+            }
+        });
         document.getElementById('copyCodeBtn').addEventListener('click', () => this.copyCode());
         document.getElementById('toggleCodeBtn').addEventListener('click', () => {
             document.querySelector('.code-panel').classList.toggle('collapsed');
+            setTimeout(() => {
+                this.setupCanvas();
+                this.render();
+            }, 300);
+        });
+
+        // Code panel resizing
+        const resizer = document.getElementById('codePanelResizer');
+        const codePanel = document.querySelector('.code-panel');
+        let isResizing = false;
+
+        resizer.addEventListener('mousedown', (e) => {
+            if (codePanel.classList.contains('collapsed')) return;
+            isResizing = true;
+            resizer.classList.add('active');
+            document.body.style.cursor = 'row-resize';
+            codePanel.style.transition = 'none';
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isResizing) return;
+            const height = window.innerHeight - e.clientY;
+            if (height > 100 && height < window.innerHeight * 0.8) {
+                codePanel.style.height = `${height}px`;
+                // Update CSS variable so it's remembered if un-collapsed
+                document.documentElement.style.setProperty('--code-panel-height', `${height}px`);
+                this.setupCanvas();
+                this.render();
+            }
+        });
+
+        window.addEventListener('mouseup', () => {
+            if (isResizing) {
+                isResizing = false;
+                resizer.classList.remove('active');
+                document.body.style.cursor = '';
+                codePanel.style.transition = '';
+            }
         });
 
         // Keyboard shortcuts
@@ -318,6 +435,9 @@ class CircuitEditor {
         document.getElementById('componentSearch').addEventListener('input', (e) => {
             this.filterComponents(e.target.value);
         });
+
+        // Code editor input
+        document.getElementById('codeOutput').addEventListener('input', (e) => this.onCodeInput(e));
 
         // Set initial tool
         this.setTool('select');
@@ -2225,12 +2345,8 @@ class CircuitEditor {
         ctx.restore();
     }
 
-    drawComponentLabel(ctx, comp) {
+    drawComponentLabel(ctx, comp, color = '#f0f6fc') {
         if (!comp.label && !comp.value) return;
-
-        ctx.font = '12px Inter, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
 
         const position = comp.labelPosition || 'top';
         const halfW = comp.def.width / 2;
@@ -2242,6 +2358,8 @@ class CircuitEditor {
         let valueX = comp.x;
         let valueY = comp.y;
 
+        let textAlign = 'center';
+
         switch (position) {
             case 'top':
                 labelY = comp.y - halfH - offset;
@@ -2252,13 +2370,13 @@ class CircuitEditor {
                 valueY = labelY + 14;
                 break;
             case 'left':
-                ctx.textAlign = 'right';
+                textAlign = 'right';
                 labelX = comp.x - halfW - offset;
                 valueX = labelX;
                 valueY = labelY + 14;
                 break;
             case 'right':
-                ctx.textAlign = 'left';
+                textAlign = 'left';
                 labelX = comp.x + halfW + offset;
                 valueX = labelX;
                 valueY = labelY + 14;
@@ -2266,14 +2384,73 @@ class CircuitEditor {
         }
 
         if (comp.label) {
-            ctx.fillStyle = '#58a6ff';
-            ctx.fillText(comp.label, labelX, labelY);
+            this.drawLatexLabel(ctx, comp.label, labelX, labelY, '#58a6ff', textAlign);
         }
 
         if (comp.value) {
-            ctx.fillStyle = '#8b949e';
-            ctx.fillText(comp.value, valueX, valueY);
+            this.drawLatexLabel(ctx, comp.value, valueX, valueY, '#8b949e', textAlign);
         }
+    }
+
+    drawLatexLabel(ctx, text, x, y, color, textAlign) {
+        const cleanText = text.replace(/\$/g, '');
+
+        const baseFontSize = 13;
+        const scriptFontSize = 9;
+        const fontStack = 'Inter, -apple-system, sans-serif';
+
+        // Helper to parse the tokens
+        const tokens = [];
+        for (let i = 0; i < cleanText.length; i++) {
+            const char = cleanText[i];
+            if (char === '_' || char === '^') {
+                const type = char === '_' ? 'sub' : 'super';
+                i++;
+                let content = '';
+                if (cleanText[i] === '{') {
+                    i++;
+                    while (i < cleanText.length && cleanText[i] !== '}') {
+                        content += cleanText[i];
+                        i++;
+                    }
+                } else {
+                    content = cleanText[i] || '';
+                }
+                tokens.push({ type, content });
+            } else {
+                tokens.push({ type: 'base', content: char });
+            }
+        }
+
+        // Measure total width
+        let totalWidth = 0;
+        tokens.forEach(t => {
+            ctx.font = t.type === 'base' ? `${baseFontSize}px ${fontStack}` : `${scriptFontSize}px ${fontStack}`;
+            totalWidth += ctx.measureText(t.content).width + (t.type !== 'base' ? 1 : 0);
+        });
+
+        // Determine starting X
+        let currentX = x;
+        if (textAlign === 'center') currentX -= totalWidth / 2;
+        else if (textAlign === 'right') currentX -= totalWidth;
+
+        // Draw
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+        ctx.fillStyle = color;
+
+        tokens.forEach(t => {
+            if (t.type === 'base') {
+                ctx.font = `${baseFontSize}px ${fontStack}`;
+                ctx.fillText(t.content, currentX, y);
+                currentX += ctx.measureText(t.content).width;
+            } else {
+                ctx.font = `${scriptFontSize}px ${fontStack}`;
+                const yOffset = t.type === 'sub' ? 4 : -4;
+                ctx.fillText(t.content, currentX, y + yOffset);
+                currentX += ctx.measureText(t.content).width + 1;
+            }
+        });
     }
 
     findJunctions() {
@@ -2435,16 +2612,86 @@ class CircuitEditor {
         return false;
     }
 
-    drawComponent(ctx, comp) {
+    /**
+     * Costruisce l'SVG del symbol Designer per un dato def e colore (per export e per cache immagini).
+     * Ritorna la stringa SVG completa o null se symbolId non disponibile.
+     */
+    buildDesignerSymbolSvg(def, color) {
+        if (!def || !def.symbolId || !this.designerSymbols.has(def.symbolId)) return null;
+        const data = this.designerSymbols.get(def.symbolId);
+        const w = def.width || 80;
+        const h = def.height || 40;
+        const colorHex = (color && color.startsWith('#')) ? color : (color === 'black' ? '#000000' : '#f0f6fc');
+        let content = data.content
+            .replace(/stroke="currentColor"/gi, `stroke="${colorHex}"`)
+            .replace(/fill="currentColor"/gi, `fill="${colorHex}"`)
+            .replace(/stroke:currentColor/gi, `stroke:${colorHex}`)
+            .replace(/\bstroke="#000000"/gi, `stroke="${colorHex}"`)
+            .replace(/\bstroke="#000"/gi, `stroke="${colorHex}"`)
+            .replace(/\bstroke='#000'/gi, `stroke="${colorHex}"`)
+            .replace(/\bfill="#000000"/gi, `fill="${colorHex}"`)
+            .replace(/\bfill="#000"/gi, `fill="${colorHex}"`)
+            .replace(/\bfill='#000'/gi, `fill="${colorHex}"`);
+        content = content.replace(/<path(\s[^>]*?)stroke="none"([^>]*)\/?\s*>/gi, (m) => {
+            if (/fill\s*=/.test(m)) return m;
+            return m.replace(/\s*\/?\s*>$/, ` fill="${colorHex}"/>`);
+        });
+        let viewBox = data.viewBox;
+        let preserveAR = '';
+        if (def.symbolId.startsWith('node_') && viewBox) {
+            const m = viewBox.match(/^([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)$/);
+            if (m) {
+                const vbW = parseFloat(m[3]), vbH = parseFloat(m[4]);
+                const tightH = vbH * 0.86;
+                if (vbH > 0 && tightH > 0) {
+                    viewBox = `${m[1]} ${m[2]} ${vbW} ${tightH}`;
+                    preserveAR = ' preserveAspectRatio="xMidYMid slice"';
+                }
+            }
+        }
+        return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${w}" height="${h}"${preserveAR}>${content}</svg>`;
+    }
+
+    /**
+     * Restituisce un Promise con l'immagine del symbol Designer (creandola e mettendola in cache se necessario).
+     * Per l'export PNG così le immagini nere sono pronte prima di disegnare.
+     */
+    getDesignerSymbolImageAsync(def, color) {
+        if (!def || !def.symbolId || !this.designerSymbols.has(def.symbolId)) return Promise.resolve(null);
+        const w = def.width || 80;
+        const h = def.height || 40;
+        const cacheKey = `${def.symbolId}_${color}_${w}_${h}`;
+        let img = this.designerSymbolImages.get(cacheKey);
+        if (img && img.complete && img.naturalWidth) return Promise.resolve(img);
+        const svgStr = this.buildDesignerSymbolSvg(def, color);
+        if (!svgStr) return Promise.resolve(null);
+        return new Promise((resolve) => {
+            const blob = new Blob([svgStr], { type: 'image/svg+xml' });
+            const url = URL.createObjectURL(blob);
+            img = new Image();
+            img.onload = () => {
+                this.designerSymbolImages.set(cacheKey, img);
+                URL.revokeObjectURL(url);
+                resolve(img);
+            };
+            img.onerror = () => {
+                URL.revokeObjectURL(url);
+                resolve(null);
+            };
+            img.src = url;
+        });
+    }
+
+    drawComponent(ctx, comp, color = '#f0f6fc') {
         ctx.save();
-        ctx.strokeStyle = '#f0f6fc';
-        ctx.fillStyle = '#f0f6fc';
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
         ctx.lineWidth = 2.5;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
 
         const def = comp.def;
-        if (!def || !def.svg) {
+        if (!def) {
             ctx.strokeRect(-20, -10, 40, 20);
             ctx.restore();
             return;
@@ -2452,6 +2699,41 @@ class CircuitEditor {
 
         if (comp.flippedX) ctx.scale(-1, 1);
         if (comp.flippedY) ctx.scale(1, -1);
+
+        const w = def.width || 80;
+        const h = def.height || 40;
+
+        // Simbolo da CircuiTikZ-Designer (data/symbols-designer.svg) se configurato e caricato
+        if (def.symbolId && this.designerSymbols.has(def.symbolId)) {
+            const cacheKey = `${def.symbolId}_${color}_${w}_${h}`;
+            let img = this.designerSymbolImages.get(cacheKey);
+            if (img && img.complete && img.naturalWidth) {
+                ctx.drawImage(img, -w / 2, -h / 2, w, h);
+                ctx.restore();
+                return;
+            }
+            const svgStr = this.buildDesignerSymbolSvg(def, color);
+            if (svgStr) {
+                const blob = new Blob([svgStr], { type: 'image/svg+xml' });
+                const url = URL.createObjectURL(blob);
+                img = new Image();
+                img.onload = () => {
+                    this.designerSymbolImages.set(cacheKey, img);
+                    URL.revokeObjectURL(url);
+                    this.render();
+                };
+                img.onerror = () => URL.revokeObjectURL(url);
+                img.src = url;
+            }
+            ctx.restore();
+            return;
+        }
+
+        if (!def.svg) {
+            ctx.strokeRect(-20, -10, 40, 20);
+            ctx.restore();
+            return;
+        }
 
         try {
             // Paths
@@ -2528,26 +2810,19 @@ class CircuitEditor {
         ctx.restore();
     }
 
-    updateCode() {
-        const code = this.generateCircuitikzCode();
-        // Highlight lines for selected elements
-        const lines = code.split('\n');
-        const highlightedLines = lines.map((line, idx) => {
-            // Check if this line corresponds to selected component or wire
-            let isHighlighted = false;
-            if (this.selectedComponent && this.componentLineIndices && this.componentLineIndices[this.selectedComponent.id] === idx) {
-                isHighlighted = true;
-            }
-            if (this.selectedWire && this.wireLineIndices && this.wireLineIndices[this.selectedWire.id] === idx) {
-                isHighlighted = true;
-            }
+    updateCode(forceFromCanvas = false) {
+        if (this.isParsingCode) return; // Don't update code while parsing code input
+        // Se il codice è stato modificato a mano, non sovrascrivere (salvo "Sincronizza da canvas")
+        if (!forceFromCanvas && this.codeManuallyEdited) return;
 
-            if (isHighlighted) {
-                return `<span style="background-color: rgba(88, 166, 255, 0.3); display: block;">${this.escapeHtml(line)}</span>`;
-            }
-            return this.escapeHtml(line);
-        });
-        document.getElementById('codeOutput').innerHTML = `<code>${highlightedLines.join('\n')}</code>`;
+        const code = this.generateCircuitikzCode();
+        const codeOutput = document.getElementById('codeOutput');
+
+        // Only update if changed to avoid cursor issues
+        if (codeOutput.value !== code) {
+            codeOutput.value = code;
+        }
+        if (forceFromCanvas) this.codeManuallyEdited = false;
     }
 
     generateCircuitikzCode() {
@@ -2563,23 +2838,33 @@ class CircuitEditor {
         this.wireLineIndices = {};
 
         lines.push('\\begin{circuitikz}[american]');
-        // Set standard heights/widths for all tripoles to ensure grid alignment
-        lines.push(`    \\ctikzset{tripoles/nmos/height=2.0, tripoles/nmos/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/pmos/height=2.0, tripoles/pmos/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/npn/height=2.0, tripoles/npn/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/pnp/height=2.0, tripoles/pnp/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/nfet/height=2.0, tripoles/nfet/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/pfet/height=2.0, tripoles/pfet/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/nfetd/height=2.0, tripoles/nfetd/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/pfetd/height=2.0, tripoles/pfetd/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/njfet/height=2.0, tripoles/njfet/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/pjfet/height=2.0, tripoles/pjfet/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/hemt/height=2.0, tripoles/hemt/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/nigbt/height=2.0, tripoles/nigbt/width=1.0}`);
-        lines.push(`    \\ctikzset{tripoles/pigbt/height=2.0, tripoles/pigbt/width=1.0}`);
 
-        lines.push('  \\ctikzset{monopoles/vcc/arrow={Triangle[open, length=8pt, width=14pt]}}');
-        lines.push('  \\ctikzset{monopoles/vee/arrow={Triangle[open, length=8pt, width=14pt]}}');
+        // 0. Only add ctikzset for components present in the circuit
+        const usedTypes = new Set(this.components.map(c => c.type));
+        const usedCategories = new Set(this.components.map(c => c.category));
+
+        const tripolesSets = [
+            { type: 'nmos', set: 'tripoles/nmos/height=2.0, tripoles/nmos/width=1.0' },
+            { type: 'pmos', set: 'tripoles/pmos/height=2.0, tripoles/pmos/width=1.0' },
+            { type: 'npn', set: 'tripoles/npn/height=2.0, tripoles/npn/width=1.0' },
+            { type: 'pnp', set: 'tripoles/pnp/height=2.0, tripoles/pnp/width=1.0' },
+            { type: 'nfet', set: 'tripoles/nfet/height=2.0, tripoles/nfet/width=1.0' },
+            { type: 'pfet', set: 'tripoles/pfet/height=2.0, tripoles/pfet/width=1.0' },
+            { type: 'njfet', set: 'tripoles/njfet/height=2.0, tripoles/njfet/width=1.0' },
+            { type: 'pjfet', set: 'tripoles/pjfet/height=2.0, tripoles/pjfet/width=1.0' },
+            { type: 'nigbt', set: 'tripoles/nigbt/height=2.0, tripoles/nigbt/width=1.0' },
+            { type: 'pigbt', set: 'tripoles/pigbt/height=2.0, tripoles/pigbt/width=1.0' }
+        ];
+
+        tripolesSets.forEach(s => {
+            if (usedTypes.has(s.type)) {
+                lines.push(`  \\ctikzset{${s.set}}`);
+            }
+        });
+
+        if (usedTypes.has('vcc')) lines.push('  \\ctikzset{monopoles/vcc/arrow={Triangle[open, length=8pt, width=14pt]}}');
+        if (usedTypes.has('vee')) lines.push('  \\ctikzset{monopoles/vee/arrow={Triangle[open, length=8pt, width=14pt]}}');
+
 
         // 1. Map world coordinates to component anchors for easy lookup
         // Only for node-based components (not bipoles drawn with to[...] syntax)
@@ -2674,10 +2959,15 @@ class CircuitEditor {
                 const relT2x = t2.x * cos - t2.y * sin;
                 const relT2y = t2.x * sin + t2.y * cos;
 
-                const startX = ((comp.x + relT1x) / scale).toFixed(1);
-                const startY = (-(comp.y + relT1y) / scale).toFixed(1);
-                const endX = ((comp.x + relT2x) / scale).toFixed(1);
-                const endY = (-(comp.y + relT2y) / scale).toFixed(1);
+                const startX = (comp.x + relT1x) / scale;
+                const startY = -(comp.y + relT1y) / scale;
+                const endX = (comp.x + relT2x) / scale;
+                const endY = -(comp.y + relT2y) / scale;
+
+                const startXStr = Number.isInteger(startX) ? startX : startX.toFixed(1);
+                const startYStr = Number.isInteger(startY) ? startY : startY.toFixed(1);
+                const endXStr = Number.isInteger(endX) ? endX : endX.toFixed(1);
+                const endYStr = Number.isInteger(endY) ? endY : endY.toFixed(1);
 
                 // Combine component type and options into to[...]
                 let pathOptions = [bipoleTypes[comp.type]()];
@@ -2690,7 +2980,7 @@ class CircuitEditor {
 
                 const optStr = pathOptions.join(', ');
                 this.componentLineIndices[comp.id] = lines.length;
-                lines.push(`  \\draw (${startX},${startY}) to[${optStr}] (${endX},${endY});`);
+                lines.push(`  \\draw (${startXStr},${startYStr}) to[${optStr}] (${endXStr},${endYStr});`);
             } else {
                 // Monopoles and Tripoles
                 let tikzName = def.tikzName;
@@ -2713,12 +3003,15 @@ class CircuitEditor {
                 if (comp.value) nodeOptions.push(`a=${comp.value}`);
 
                 // Center-based placement
-                const nodeX = (comp.x / scale).toFixed(1);
-                const nodeY = (-comp.y / scale).toFixed(1);
+                const nodeX = (comp.x / scale);
+                const nodeY = (-comp.y / scale);
+
+                const nodeXStr = Number.isInteger(nodeX) ? nodeX : nodeX.toFixed(1);
+                const nodeYStr = Number.isInteger(nodeY) ? nodeY : nodeY.toFixed(1);
 
                 const optStr = nodeOptions.length > 0 ? `, ${nodeOptions.join(', ')}` : '';
                 this.componentLineIndices[comp.id] = lines.length;
-                lines.push(`  \\node[${tikzName}${optStr}] (${comp.name}) at (${nodeX},${nodeY}) {};`);
+                lines.push(`  \\node[${tikzName}${optStr}] (${comp.name}) at (${nodeXStr},${nodeYStr}) {};`);
 
                 // Bulk/Doublegate connections
                 if (comp.transistorOptions && comp.transistorOptions.includes('bulk') && comp.bulkConnection) {
@@ -2737,8 +3030,18 @@ class CircuitEditor {
             const startAnchor = terminalMap.get(`${wire.x1},${wire.y1}`);
             const endAnchor = terminalMap.get(`${wire.x2},${wire.y2}`);
 
-            const p1 = startAnchor ? `(${startAnchor})` : `(${(wire.x1 / scale).toFixed(1)},${(-wire.y1 / scale).toFixed(1)})`;
-            const p2 = endAnchor ? `(${endAnchor})` : `(${(wire.x2 / scale).toFixed(1)},${(-wire.y2 / scale).toFixed(1)})`;
+            const startX = (wire.x1 / scale);
+            const startY = (-wire.y1 / scale);
+            const endX = (wire.x2 / scale);
+            const endY = (-wire.y2 / scale);
+
+            const startXStr = Number.isInteger(startX) ? startX : startX.toFixed(1);
+            const startYStr = Number.isInteger(startY) ? startY : startY.toFixed(1);
+            const endXStr = Number.isInteger(endX) ? endX : endX.toFixed(1);
+            const endYStr = Number.isInteger(endY) ? endY : endY.toFixed(1);
+
+            const p1 = startAnchor ? `(${startAnchor})` : `(${startXStr},${startYStr})`;
+            const p2 = endAnchor ? `(${endAnchor})` : `(${endXStr},${endYStr})`;
 
             // Use orthogonal wires if aligned
             if (Math.abs(wire.x1 - wire.x2) < 1 || Math.abs(wire.y1 - wire.y2) < 1) {
@@ -2755,7 +3058,13 @@ class CircuitEditor {
         junctions.forEach(junc => {
             const key = `${junc.x},${junc.y}`;
             const anchor = terminalMap.get(key);
-            const pos = anchor ? `(${anchor})` : `(${(junc.x / scale).toFixed(1)},${(-junc.y / scale).toFixed(1)})`;
+
+            const jx = (junc.x / scale);
+            const jy = (-junc.y / scale);
+            const jxStr = Number.isInteger(jx) ? jx : jx.toFixed(1);
+            const jyStr = Number.isInteger(jy) ? jy : jy.toFixed(1);
+
+            const pos = anchor ? `(${anchor})` : `(${jxStr},${jyStr})`;
             lines.push(`  \\node[circ] at ${pos} {};`);
         });
 
@@ -2770,12 +3079,67 @@ class CircuitEditor {
     }
 
     copyCode() {
-        const code = this.generateCircuitikzCode();
+        const code = document.getElementById('codeOutput').value;
         navigator.clipboard.writeText(code).then(() => {
-            this.showToast('Code copied to clipboard!', 'success');
+            this.showToast('Codice copiato negli appunti', 'success');
         }).catch(() => {
-            this.showToast('Failed to copy code', 'error');
+            this.showToast('Copia fallita', 'error');
         });
+    }
+
+    async previewLaTeX() {
+        const code = document.getElementById('codeOutput').value;
+        if (!code || !code.includes('\\begin{circuitikz}')) {
+            this.showToast('Inserisci codice Circuitikz valido', 'error');
+            return;
+        }
+        const panel = document.getElementById('latexPreviewPanel');
+        const img = document.getElementById('latexPreviewImage');
+        const errEl = document.getElementById('latexPreviewError');
+        const loadEl = document.getElementById('latexPreviewLoading');
+        const fallbackEl = document.getElementById('latexPreviewFallback');
+        panel.style.display = 'block';
+        errEl.style.display = 'none';
+        fallbackEl.style.display = 'none';
+        img.style.display = 'none';
+        loadEl.style.display = 'block';
+        const apiUrl = (typeof window.PREVIEW_API_URL !== 'undefined') ? window.PREVIEW_API_URL : '/api/preview';
+        try {
+            const res = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code: code.trim() })
+            });
+            const data = await res.json().catch(() => ({}));
+            loadEl.style.display = 'none';
+            // Il server restituisce sempre 200; gli errori sono in data.error
+            if (data.error) {
+                errEl.textContent = data.error;
+                errEl.style.display = 'block';
+                fallbackEl.style.display = 'block';
+                return;
+            }
+            if (!res.ok) {
+                errEl.textContent = data.message || 'Errore di compilazione';
+                errEl.style.display = 'block';
+                return;
+            }
+            if (data.imageUrl) {
+                img.src = data.imageUrl;
+                img.style.display = 'block';
+            } else if (data.imageBase64) {
+                img.src = 'data:image/png;base64,' + data.imageBase64;
+                img.style.display = 'block';
+            } else {
+                errEl.textContent = 'Risposta non valida dal server';
+                errEl.style.display = 'block';
+            }
+        } catch (e) {
+            loadEl.style.display = 'none';
+            errEl.textContent = 'Impossibile contattare il server. Avvia il backend (node server.js) per usare l\'anteprima LaTeX.';
+            errEl.style.display = 'block';
+            document.getElementById('latexPreviewFallback').style.display = 'block';
+        }
     }
 
     showToast(message, type = '') {
@@ -3201,6 +3565,491 @@ class CircuitEditor {
             snappedToWireEnd: false,
             snappedToWireBody: false
         };
+    }
+    onCodeInput(e) {
+        this.codeManuallyEdited = true; // Codice modificato a mano: non sovrascrivere dalla canvas
+        clearTimeout(this.parseTimer);
+        this.parseTimer = setTimeout(() => {
+            this.parseCode(e.target.value);
+        }, 1000); // 1s debounce
+    }
+
+    getCompFromTikzName(tikzName) {
+        if (!this.tikzMap) {
+            this.tikzMap = {};
+            for (const catKey in COMPONENTS) {
+                for (const compKey in COMPONENTS[catKey].items) {
+                    const item = COMPONENTS[catKey].items[compKey];
+                    // Skip if item doesn't have tikzName
+                    if (!item.tikzName) continue;
+                    this.tikzMap[item.tikzName] = { type: compKey, category: catKey };
+                    if (item.depletionVariant) {
+                        this.tikzMap[item.depletionVariant] = { type: compKey, category: catKey, depletion: true };
+                    }
+                }
+            }
+            // Aliases Circuitikz: nomi usati in to[X] e node[X] -> nostro componente (compatibilità 100%)
+            this.tikzMap['R'] = { type: 'resistor', category: 'resistors' };
+            this.tikzMap['vR'] = { type: 'varResistor', category: 'resistors' };
+            this.tikzMap['pR'] = { type: 'potentiometer', category: 'resistors' };
+            this.tikzMap['resistor'] = { type: 'resistor', category: 'resistors' };
+            this.tikzMap['vresistor'] = { type: 'varResistor', category: 'resistors' };
+            this.tikzMap['potentiometer'] = { type: 'potentiometer', category: 'resistors' };
+            this.tikzMap['generic'] = { type: 'resistor', category: 'resistors' };
+            this.tikzMap['genericpotentiometer'] = { type: 'potentiometer', category: 'resistors' };
+            this.tikzMap['thermistor'] = this.tikzMap['thermistorntc'] = this.tikzMap['thermistorptc'] = { type: 'resistor', category: 'resistors' };
+            this.tikzMap['photoresistor'] = this.tikzMap['phR'] = this.tikzMap['ldR'] = this.tikzMap['ldresistor'] = this.tikzMap['ldgeneric'] = { type: 'resistor', category: 'resistors' };
+            this.tikzMap['varistor'] = this.tikzMap['mov'] = this.tikzMap['resistivesens'] = this.tikzMap['sR'] = { type: 'resistor', category: 'resistors' };
+            this.tikzMap['memristor'] = this.tikzMap['Mr'] = { type: 'resistor', category: 'resistors' };
+            this.tikzMap['C'] = { type: 'capacitor', category: 'dynamics' };
+            this.tikzMap['eC'] = this.tikzMap['elko'] = this.tikzMap['ecapacitor'] = { type: 'polarCap', category: 'dynamics' };
+            this.tikzMap['cC'] = this.tikzMap['ccapacitor'] = { type: 'curvedCap', category: 'dynamics' };
+            this.tikzMap['vC'] = this.tikzMap['vcapacitor'] = { type: 'varCapacitor', category: 'dynamics' };
+            this.tikzMap['capacitor'] = { type: 'capacitor', category: 'dynamics' };
+            this.tikzMap['capacitivesens'] = this.tikzMap['sC'] = { type: 'capSensor', category: 'dynamics' };
+            this.tikzMap['ferrocap'] = this.tikzMap['feC'] = { type: 'ferroCap', category: 'dynamics' };
+            this.tikzMap['L'] = { type: 'inductor', category: 'dynamics' };
+            this.tikzMap['inductor'] = this.tikzMap['vL'] = this.tikzMap['cuteinductor'] = this.tikzMap['americaninductor'] = this.tikzMap['europeaninductor'] = { type: 'inductor', category: 'dynamics' };
+            this.tikzMap['vcuteinductor'] = this.tikzMap['vamericaninductor'] = this.tikzMap['veuropeaninductor'] = { type: 'inductor', category: 'dynamics' };
+            this.tikzMap['V'] = this.tikzMap['vsource'] = this.tikzMap['vsourceAM'] = this.tikzMap['vsourcesquare'] = this.tikzMap['vsourcetri'] = { type: 'vsource', category: 'sources' };
+            this.tikzMap['sV'] = this.tikzMap['vsourcesin'] = { type: 'vsourceAC', category: 'sources' };
+            this.tikzMap['I'] = this.tikzMap['isource'] = this.tikzMap['dcisource'] = this.tikzMap['isourcesin'] = { type: 'isource', category: 'sources' };
+            this.tikzMap['battery1'] = this.tikzMap['battery2'] = this.tikzMap['battery'] = { type: 'battery', category: 'sources' };
+            this.tikzMap['solar'] = this.tikzMap['pvsource'] = this.tikzMap['pvmodule'] = { type: 'battery', category: 'sources' };
+            this.tikzMap['esource'] = this.tikzMap['dcvsource'] = { type: 'vsource', category: 'sources' };
+            this.tikzMap['D'] = { type: 'diode', category: 'diodes' };
+            this.tikzMap['zD'] = { type: 'zener', category: 'diodes' };
+            this.tikzMap['led'] = this.tikzMap['leD'] = { type: 'led', category: 'diodes' };
+            this.tikzMap['pD'] = { type: 'photodiode', category: 'diodes' };
+            this.tikzMap['fuse'] = { type: 'fuse', category: 'sources' };
+            this.tikzMap['lamp'] = { type: 'lamp', category: 'sources' };
+            this.tikzMap['short'] = this.tikzMap['open'] = this.tikzMap['crossing'] = this.tikzMap['xing'] = null; // filo/junzione, non componente
+            this.tikzMap['nos'] = { type: 'switchOpen', category: 'switches' };
+            this.tikzMap['nmosd'] = { type: 'nmos', category: 'transistors' };
+            this.tikzMap['pmosd'] = { type: 'pmos', category: 'transistors' };
+            this.tikzMap['nfetd'] = { type: 'nfet', category: 'transistors' };
+            this.tikzMap['pfetd'] = { type: 'pfet', category: 'transistors' };
+        }
+        return this.tikzMap[tikzName] || null;
+    }
+
+    parsePoint(str, nodeCoords, scale) {
+        str = str.trim();
+        if (str.startsWith('(') && str.endsWith(')')) {
+            str = str.substring(1, str.length - 1);
+        }
+
+        if (str.includes(',')) {
+            const parts = str.split(',');
+            const lx = parseFloat(parts[0]);
+            const ly = parseFloat(parts[1]);
+            if (!isNaN(lx) && !isNaN(ly)) {
+                return { x: lx * scale, y: -ly * scale };
+            }
+        }
+
+        return nodeCoords[str] || null;
+    }
+
+    parseCode(code) {
+        if (!code.includes('\\begin{circuitikz}')) return;
+
+        this.isParsingCode = true;
+        try {
+            const scale = 40;
+            const newComponents = [];
+            const newWires = [];
+            this.componentCounters = {};
+            let localNextId = 1;
+
+            const nodeCoords = {};
+
+            // Normalize code: remove comments and extra whitespace
+            const cleanCode = code.replace(/%.*$/gm, '').replace(/\s+/g, ' ');
+
+            // 1. Parse Nodes (Tripoles, Monopoles)
+            const nodeRegex = /\\node\s*\[([^\]]+)\]\s*\(([^)]+)\)\s*at\s*\(([^,]+),([^)]+)\)\s*\{\};/g;
+            let match;
+            while ((match = nodeRegex.exec(cleanCode)) !== null) {
+                const optionsStr = match[1];
+                const name = match[2];
+                const lx = parseFloat(match[3]);
+                const ly = parseFloat(match[4]);
+
+                if (optionsStr === 'circ') continue;
+
+                const options = optionsStr.split(',').map(s => s.trim());
+                const tikzName = options[0];
+
+                const compInfo = this.getCompFromTikzName(tikzName);
+                if (compInfo) {
+                    const wx = lx * scale;
+                    const wy = -ly * scale;
+
+                    const comp = {
+                        id: localNextId++,
+                        type: compInfo.type,
+                        category: compInfo.category,
+                        name: name,
+                        x: wx,
+                        y: wy,
+                        rotation: 0,
+                        flippedX: false,
+                        flippedY: false,
+                        label: '',
+                        value: '',
+                        def: COMPONENTS[compInfo.category].items[compInfo.type]
+                    };
+
+                    options.forEach(opt => {
+                        if (opt.startsWith('rotate=')) comp.rotation = -parseFloat(opt.split('=')[1]);
+                        if (opt === 'xscale=-1') comp.flippedX = true;
+                        if (opt === 'yscale=-1') comp.flippedY = true;
+                        if (opt.startsWith('l=$')) comp.label = opt.substring(3, opt.length - 1);
+                        if (opt.startsWith('a=')) comp.value = opt.substring(2);
+                    });
+
+                    newComponents.push(comp);
+
+                    const terminals = this.getComponentTerminals(comp);
+                    terminals.forEach((term, idx) => {
+                        const anchor = comp.def.terminals[idx].anchor;
+                        const ref = anchor ? `${name}.${anchor}` : name;
+                        nodeCoords[ref] = { x: term.x, y: term.y };
+                    });
+                    nodeCoords[name] = { x: wx, y: wy };
+                }
+            }
+
+            // 1b. Nodi inline: (x,y) node [ground] {} o (x,y) node [vcc] (GND1) {} (compatibilità Circuitikz)
+            const inlineNodeRegex = /\(\s*([^,)]+)\s*,\s*([^)]+)\s*\)\s*node\s*\[\s*([^\]]+)\]\s*(?:\(\s*([^)]+)\s*\))?\s*\{\s*\}/g;
+            while ((match = inlineNodeRegex.exec(cleanCode)) !== null) {
+                const lx = parseFloat(match[1]);
+                const ly = parseFloat(match[2]);
+                if (isNaN(lx) || isNaN(ly)) continue;
+                const optionsStr = match[3];
+                const optName = match[4] || null;
+                const options = optionsStr.split(',').map(s => s.trim());
+                const tikzName = options[0];
+                if (tikzName === 'circ') continue; // giunzione, nessun componente
+                const compInfo = this.getCompFromTikzName(tikzName);
+                if (compInfo) {
+                    const wx = lx * scale;
+                    const wy = -ly * scale;
+                    const comp = {
+                        id: localNextId++,
+                        type: compInfo.type,
+                        category: compInfo.category,
+                        name: optName || this.generateComponentName(compInfo.type),
+                        x: wx,
+                        y: wy,
+                        rotation: 0,
+                        flippedX: false,
+                        flippedY: false,
+                        label: '',
+                        value: '',
+                        def: COMPONENTS[compInfo.category].items[compInfo.type]
+                    };
+                    newComponents.push(comp);
+                    const terminals = this.getComponentTerminals(comp);
+                    terminals.forEach((term, idx) => {
+                        const anchor = comp.def.terminals[idx].anchor;
+                        const ref = anchor ? `${comp.name}.${anchor}` : comp.name;
+                        nodeCoords[ref] = { x: term.x, y: term.y };
+                    });
+                    nodeCoords[comp.name] = { x: wx, y: wy };
+                }
+            }
+
+            // 2. Parse Bipoles: ogni (p1) to[opts] (p2) nel codice (anche più segmenti per \draw)
+            const bipoleRegex = /(\([^)]+\))\s*to\s*\[([^\]]+)\]\s*(\([^)]+\))/g;
+            while ((match = bipoleRegex.exec(cleanCode)) !== null) {
+                const p1Str = match[1];
+                const optionsStr = match[2];
+                const p2Str = match[3];
+
+                const p1 = this.parsePoint(p1Str, nodeCoords, scale);
+                const p2 = this.parsePoint(p2Str, nodeCoords, scale);
+
+                if (!p1 || !p2) continue;
+
+                const options = optionsStr.split(',').map(s => s.trim());
+                // Find first non-parameter option that matches a tikzName
+                let tikzName = options.find(opt => this.getCompFromTikzName(opt.split(' ')[0]));
+                if (!tikzName) {
+                    // Try exact match or first option
+                    tikzName = options[0].split(' ')[0];
+                } else {
+                    tikzName = tikzName.split(' ')[0];
+                }
+
+                const compInfo = this.getCompFromTikzName(tikzName);
+                if (compInfo) {
+                    const cx = (p1.x + p2.x) / 2;
+                    const cy = (p1.y + p2.y) / 2;
+
+                    let rot = Math.atan2(p2.y - p1.y, p2.x - p1.x) * 180 / Math.PI;
+                    rot = Math.round(rot / 90) * 90;
+
+                    const comp = {
+                        id: localNextId++,
+                        type: compInfo.type,
+                        category: compInfo.category,
+                        name: '', // Will be assigned by generate
+                        x: cx,
+                        y: cy,
+                        rotation: -rot,
+                        flippedX: false,
+                        flippedY: false,
+                        label: '',
+                        value: '',
+                        style: options.includes('european resistor') ? 'european' : 'default',
+                        def: COMPONENTS[compInfo.category].items[compInfo.type]
+                    };
+
+                    options.forEach(opt => {
+                        if (opt.startsWith('l=$')) comp.label = opt.substring(3, opt.length - 1);
+                        if (opt.startsWith('a=')) comp.value = opt.substring(2);
+                    });
+
+                    comp.name = this.generateComponentName(comp.type);
+                    newComponents.push(comp);
+                    // Filo tra i due estremi del bipolo così il circuito risulta connesso
+                    newWires.push({
+                        id: localNextId++,
+                        x1: p1.x, y1: p1.y,
+                        x2: p2.x, y2: p2.y,
+                        cornerMode: 'hv'
+                    });
+                } else {
+                    // Segmento non riconosciuto come bipolo → trattalo come filo
+                    newWires.push({
+                        id: localNextId++,
+                        x1: p1.x, y1: p1.y,
+                        x2: p2.x, y2: p2.y,
+                        cornerMode: 'hv'
+                    });
+                }
+            }
+
+            // 3. Parse explicit Wires: ogni (p1) -- (p2) o (p1) |- (p2) o (p1) -| (p2)
+            const wireRegex = /(\([^)]+\))\s*(--|\-\||\|\-)\s*(\([^)]+\))/g;
+            while ((match = wireRegex.exec(cleanCode)) !== null) {
+                const p1Str = match[1];
+                const connector = match[2];
+                const p2Str = match[3];
+
+                const p1 = this.parsePoint(p1Str, nodeCoords, scale);
+                const p2 = this.parsePoint(p2Str, nodeCoords, scale);
+
+                if (p1 && p2) {
+                    const cornerMode = (connector === '|-' ? 'vh' : (connector === '-|' ? 'hv' : 'hv'));
+                    newWires.push({
+                        id: localNextId++,
+                        x1: p1.x, y1: p1.y,
+                        x2: p2.x, y2: p2.y,
+                        cornerMode
+                    });
+                }
+            }
+
+            // Update state (aggiorna anche con solo fili, es. circuito solo bipoli)
+            if (newComponents.length > 0 || newWires.length > 0) {
+                this.components = newComponents;
+                this.wires = newWires;
+                this.nextId = localNextId;
+                this.render();
+            }
+
+        } catch (e) {
+            console.error("Parse error:", e);
+        } finally {
+            this.isParsingCode = false;
+        }
+    }
+
+    async exportImage(format = 'png') {
+        const components = this.components;
+        const wires = this.wires;
+
+        if (components.length === 0 && wires.length === 0) {
+            this.showToast('Nothing to export!', 'error');
+            return;
+        }
+
+        const margin = parseInt(document.getElementById('exportMargin').value) || 20;
+
+        // 1. Calculate bounding box
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
+        components.forEach(comp => {
+            const w = (comp.def && comp.def.width) ? comp.def.width / 2 + 30 : 50;
+            const h = (comp.def && comp.def.height) ? comp.def.height / 2 + 30 : 50;
+            minX = Math.min(minX, comp.x - w);
+            minY = Math.min(minY, comp.y - h);
+            maxX = Math.max(maxX, comp.x + w);
+            maxY = Math.max(maxY, comp.y + h);
+        });
+
+        wires.forEach(wire => {
+            minX = Math.min(minX, wire.x1, wire.x2);
+            minY = Math.min(minY, wire.y1, wire.y2);
+            maxX = Math.max(maxX, wire.x1, wire.x2);
+            maxY = Math.max(maxY, wire.y1, wire.y2);
+        });
+
+        const exportWidth = Math.ceil((maxX - minX) + 2 * margin);
+        const exportHeight = Math.ceil((maxY - minY) + 2 * margin);
+
+        if (format === 'png') {
+            const exportColor = '#000000';
+            await Promise.all(components.map(comp => comp.def && comp.def.symbolId ? this.getDesignerSymbolImageAsync(comp.def, exportColor) : Promise.resolve(null)));
+
+            const canvas = document.createElement('canvas');
+            canvas.width = exportWidth;
+            canvas.height = exportHeight;
+            const ctx = canvas.getContext('2d');
+
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, exportWidth, exportHeight);
+
+            ctx.save();
+            ctx.translate(margin - minX, margin - minY);
+
+            const junctions = this.findJunctions();
+
+            wires.forEach(wire => {
+                ctx.beginPath();
+                ctx.moveTo(wire.x1, wire.y1);
+                const isHorizontal = Math.abs(wire.y1 - wire.y2) < 1;
+                const isVertical = Math.abs(wire.x1 - wire.x2) < 1;
+                if (isHorizontal || isVertical) {
+                    ctx.lineTo(wire.x2, wire.y2);
+                } else {
+                    const mode = wire.cornerMode || 'hv';
+                    if (mode === 'vh') {
+                        ctx.lineTo(wire.x1, wire.y2);
+                        ctx.lineTo(wire.x2, wire.y2);
+                    } else {
+                        ctx.lineTo(wire.x2, wire.y1);
+                        ctx.lineTo(wire.x2, wire.y2);
+                    }
+                }
+                ctx.strokeStyle = exportColor;
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            });
+
+            junctions.forEach(junc => {
+                ctx.beginPath();
+                ctx.arc(junc.x, junc.y, 5, 0, Math.PI * 2);
+                ctx.fillStyle = exportColor;
+                ctx.fill();
+            });
+
+            components.forEach(comp => {
+                ctx.save();
+                ctx.translate(comp.x, comp.y);
+                ctx.rotate(-comp.rotation * Math.PI / 180);
+                this.drawComponent(ctx, comp, exportColor);
+                ctx.restore();
+                this.drawComponentLabel(ctx, comp, exportColor);
+            });
+
+            ctx.restore();
+
+            const link = document.createElement('a');
+            link.download = `circuit_${Date.now()}.png`;
+            link.href = canvas.toDataURL('image/png');
+            link.click();
+            this.showToast('Circuit exported as PNG!', 'success');
+        } else if (format === 'svg') {
+            // Basic SVG export
+            let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${exportWidth}" height="${exportHeight}" viewBox="0 0 ${exportWidth} ${exportHeight}">`;
+            svg += `<rect width="100%" height="100%" fill="white"/>`;
+            svg += `<g transform="translate(${margin - minX}, ${margin - minY})">`;
+
+            const exportColor = 'black';
+            const junctions = this.findJunctions();
+
+            // Wires
+            wires.forEach(wire => {
+                let d = `M ${wire.x1} ${wire.y1}`;
+                const isHorizontal = Math.abs(wire.y1 - wire.y2) < 1;
+                const isVertical = Math.abs(wire.x1 - wire.x2) < 1;
+                if (isHorizontal || isVertical) {
+                    d += ` L ${wire.x2} ${wire.y2}`;
+                } else {
+                    const mode = wire.cornerMode || 'hv';
+                    if (mode === 'vh') {
+                        d += ` L ${wire.x1} ${wire.y2} L ${wire.x2} ${wire.y2}`;
+                    } else {
+                        d += ` L ${wire.x2} ${wire.y1} L ${wire.x2} ${wire.y2}`;
+                    }
+                }
+                svg += `<path d="${d}" stroke="${exportColor}" stroke-width="2" fill="none" stroke-linecap="round"/>`;
+            });
+
+            // Junctions
+            junctions.forEach(junc => {
+                svg += `<circle cx="${junc.x}" cy="${junc.y}" r="5" fill="${exportColor}"/>`;
+            });
+
+            // Components
+            components.forEach(comp => {
+                const angle = -comp.rotation;
+                let transform = `translate(${comp.x}, ${comp.y}) rotate(${angle})`;
+                if (comp.flippedX || comp.flippedY) {
+                    let scaleX = comp.flippedX ? -1 : 1;
+                    let scaleY = comp.flippedY ? -1 : 1;
+                    transform += ` scale(${scaleX}, ${scaleY})`;
+                }
+
+                svg += `<g transform="${transform}">`;
+                if (comp.def) {
+                    const def = comp.def;
+                    const w = def.width || 80;
+                    const h = def.height || 40;
+                    const symbolSvg = def.symbolId && this.designerSymbols.has(def.symbolId)
+                        ? this.buildDesignerSymbolSvg(def, exportColor)
+                        : null;
+                    if (symbolSvg) {
+                        const withPos = symbolSvg.replace(/^<svg/, `<svg x="${-w / 2}" y="${-h / 2}"`);
+                        svg += withPos;
+                    } else if (def.svg) {
+                        svg += def.svg.replace(/currentColor/g, exportColor);
+                    }
+                }
+                svg += `</g>`;
+
+                // Labels (simplistic implementation)
+                if (comp.label || comp.value) {
+                    // We'd need to handle label positioning logic here too, or just reuse a helper
+                    // For now let's just use the approximate bounding box centers
+                    const position = comp.labelPosition || 'top';
+                    let lx = comp.x, ly = comp.y;
+                    const offset = 20;
+                    if (position === 'top') ly -= comp.def.height / 2 + offset;
+                    else if (position === 'bottom') ly += comp.def.height / 2 + offset;
+                    else if (position === 'left') lx -= comp.def.width / 2 + offset;
+                    else if (position === 'right') lx += comp.def.width / 2 + offset;
+
+                    if (comp.label) svg += `<text x="${lx}" y="${ly}" font-family="Arial" font-size="12" text-anchor="middle" fill="${exportColor}">${comp.label}</text>`;
+                    if (comp.value) svg += `<text x="${lx}" y="${ly + 14}" font-family="Arial" font-size="12" text-anchor="middle" fill="${exportColor}">${comp.value}</text>`;
+                }
+            });
+
+            svg += `</g></svg>`;
+
+            const blob = new Blob([svg], { type: 'image/svg+xml' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.download = `circuit_${Date.now()}.svg`;
+            link.href = url;
+            link.click();
+            URL.revokeObjectURL(url);
+            this.showToast('Circuit exported as SVG!', 'success');
+        }
     }
 }
 
